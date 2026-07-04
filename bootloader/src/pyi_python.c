@@ -316,6 +316,52 @@ pyi_python_install_pyz(const struct PYI_CONTEXT *pyi_ctx)
         return -1;
     }
 
+    if (archive->pkg_data) {
+        char pyz_filename[PYI_PATH_MAX];
+        FILE *pyz_fp;
+
+        if (pyi_path_join(pyz_filename, pyi_ctx->application_home_dir, "_wwn_pyz.pyz") == NULL) {
+            PYI_ERROR("Failed to format decrypted PYZ path\n");
+            return -1;
+        }
+
+        pyz_fp = pyi_path_fopen(pyz_filename, "wb");
+        if (pyz_fp == NULL) {
+            PYI_ERROR("Failed to create decrypted PYZ file: %s\n", pyz_filename);
+            return -1;
+        }
+        if (fwrite(archive->pkg_data + toc_entry->offset, 1, toc_entry->length, pyz_fp) != toc_entry->length || ferror(pyz_fp)) {
+            fclose(pyz_fp);
+            PYI_ERROR("Failed to write decrypted PYZ file: %s\n", pyz_filename);
+            return -1;
+        }
+        fclose(pyz_fp);
+
+#ifdef _WIN32
+        archive_filename_obj = dylib_python->PyUnicode_Decode(pyz_filename, strlen(pyz_filename), "utf-8", "strict");
+#else
+        archive_filename_obj = dylib_python->PyUnicode_DecodeFSDefault(pyz_filename);
+#endif
+        pyz_path_obj = dylib_python->PyUnicode_FromFormat("%U?0", archive_filename_obj);
+        dylib_python->Py_DecRef(archive_filename_obj);
+
+        if (pyz_path_obj == NULL) {
+            PYI_ERROR("Failed to format decrypted PYZ path and offset\n");
+            return -1;
+        }
+
+        rc = dylib_python->PySys_SetObject(attr_name, pyz_path_obj);
+        dylib_python->Py_DecRef(pyz_path_obj);
+
+        if (rc != 0) {
+            PYI_ERROR("Failed to store path to decrypted PYZ archive into sys.%s!\n", attr_name);
+            return -1;
+        }
+
+        PYI_DEBUG("LOADER: path to decrypted PYZ archive stored into sys.%s...\n", attr_name);
+        return 0;
+    }
+
     /* Store archive filename as Python string. */
 #ifdef _WIN32
     /* Decode UTF-8 to PyUnicode */

@@ -66,6 +66,9 @@ struct ARCHIVE
 
     uint64_t pkg_offset; /* Offset of the PKG archive in the file */
 
+    unsigned char *pkg_data; /* Memory-backed PKG archive, used by WWN encrypted archives */
+    uint64_t pkg_size;
+
     struct TOC_ENTRY *toc; /* Buffer containing all TOC entries */
     const struct TOC_ENTRY *toc_end; /* The address at which the TOC buffer ends */
 

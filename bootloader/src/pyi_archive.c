@@ -29,6 +29,168 @@
 #include "pyi_utils.h"
 
 
+static bool _pyi_archive_is_extractable(char typecode);
+
+
+#define WWN_PYI_MAGIC "WWNPYI1!"
+
+#pragma pack(push, 1)
+struct WWN_PYI_FOOTER
+{
+    char magic[8];
+    uint64_t key;
+    uint64_t pkg_offset;
+    uint64_t pkg_size;
+};
+#pragma pack(pop)
+
+
+static void
+_wwn_decrypt_data(unsigned char *data, uint64_t size, uint64_t key)
+{
+    uint8_t key_xor_aa = (uint8_t)(key ^ 0xAA);
+    uint8_t key_xor_aa_shr8 = (uint8_t)((key ^ 0xAA) >> 8);
+    uint64_t i;
+
+    for (i = 0; i < size; i++) {
+        uint64_t subkey = key ^ (i * 0x9E3779B97F4A7C15ULL);
+        uint8_t shift1 = (uint8_t)((i * 8) & 0x3F);
+        uint8_t shift2 = (uint8_t)((24 + i * 8) & 0x3F);
+        uint8_t shift3 = (uint8_t)((56 + i * 8) & 0x3F);
+        uint8_t mask;
+
+        subkey = (subkey ^ (subkey >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        subkey = (subkey ^ (subkey >> 27)) * 0x94D049BB133111EBULL;
+        subkey = subkey ^ (subkey >> 31);
+
+        mask = (uint8_t)(subkey >> shift1) ^ (uint8_t)(subkey >> shift2) ^ (uint8_t)(subkey >> shift3);
+
+        data[i] += key_xor_aa_shr8;
+        data[i] -= key_xor_aa;
+        data[i] ^= mask;
+    }
+}
+
+
+static int
+_wwn_archive_try_open(FILE *archive_fp, const char *filename, struct ARCHIVE **archive_ref)
+{
+    struct WWN_PYI_FOOTER footer;
+    struct ARCHIVE_COOKIE archive_cookie;
+    struct ARCHIVE *archive = NULL;
+    struct TOC_ENTRY *toc_entry;
+    uint64_t file_size;
+
+    *archive_ref = NULL;
+
+    if (pyi_fseek(archive_fp, 0, SEEK_END) < 0) {
+        return 0;
+    }
+    file_size = pyi_ftell(archive_fp);
+    if (file_size < sizeof(footer)) {
+        PYI_DEBUG("LOADER: file too small for WWN footer!\n");
+        return 0;
+    }
+    if (pyi_fseek(archive_fp, file_size - sizeof(footer), SEEK_SET) < 0) {
+        return 0;
+    }
+    if (fread(&footer, sizeof(footer), 1, archive_fp) < 1) {
+        PYI_DEBUG("LOADER: failed to read WWN footer!\n");
+        return 0;
+    }
+    if (memcmp(footer.magic, WWN_PYI_MAGIC, sizeof(footer.magic)) != 0) {
+        PYI_DEBUG("LOADER: WWN footer not found at EOF!\n");
+        return 0;
+    }
+
+    PYI_DEBUG("LOADER: WWN footer found: pkg_offset=0x%" PRIX64 ", pkg_size=%" PRIu64 "\n", footer.pkg_offset, footer.pkg_size);
+
+    if (footer.pkg_size < sizeof(struct ARCHIVE_COOKIE) || footer.pkg_offset + footer.pkg_size > file_size - sizeof(footer)) {
+        PYI_DEBUG("LOADER: invalid WWN PyInstaller footer! file_size=%" PRIu64 ", footer_size=%zu\n", file_size, sizeof(footer));
+        return -1;
+    }
+
+    archive = (struct ARCHIVE *)calloc(1, sizeof(struct ARCHIVE));
+    if (archive == NULL) {
+        PYI_PERROR("calloc", "Could not allocate memory for archive structure!\n");
+        return -1;
+    }
+
+    snprintf(archive->filename, PYI_PATH_MAX, "%s", filename);
+    archive->pkg_offset = 0;
+    archive->pkg_size = footer.pkg_size;
+    archive->pkg_data = (unsigned char *)malloc((size_t)footer.pkg_size);
+    if (archive->pkg_data == NULL) {
+        PYI_PERROR("malloc", "Could not allocate memory for encrypted archive!\n");
+        goto fail;
+    }
+
+    if (pyi_fseek(archive_fp, footer.pkg_offset, SEEK_SET) < 0) {
+        PYI_PERROR("fseek", "Failed to seek to WWN archive position!\n");
+        goto fail;
+    }
+    if (fread(archive->pkg_data, 1, (size_t)footer.pkg_size, archive_fp) != footer.pkg_size) {
+        PYI_PERROR("fread", "Failed to read WWN encrypted archive!\n");
+        goto fail;
+    }
+
+    _wwn_decrypt_data(archive->pkg_data, footer.pkg_size, footer.key);
+    memcpy(&archive_cookie, archive->pkg_data + footer.pkg_size - sizeof(struct ARCHIVE_COOKIE), sizeof(struct ARCHIVE_COOKIE));
+
+    archive_cookie.pkg_length = pyi_be32toh(archive_cookie.pkg_length);
+    archive_cookie.toc_offset = pyi_be32toh(archive_cookie.toc_offset);
+    archive_cookie.toc_length = pyi_be32toh(archive_cookie.toc_length);
+    archive_cookie.python_version = pyi_be32toh(archive_cookie.python_version);
+
+    if (archive_cookie.pkg_length != footer.pkg_size || archive_cookie.toc_offset + archive_cookie.toc_length > footer.pkg_size) {
+        PYI_DEBUG(
+            "LOADER: invalid decrypted WWN PyInstaller archive! pkg_length=%u, toc_offset=%u, toc_length=%u, footer_pkg_size=%" PRIu64 "\n",
+            archive_cookie.pkg_length,
+            archive_cookie.toc_offset,
+            archive_cookie.toc_length,
+            footer.pkg_size
+        );
+        goto fail;
+    }
+
+    archive->python_version = archive_cookie.python_version;
+    snprintf(archive->python_libname, 64, "%s", archive_cookie.python_libname);
+
+    archive->toc = (struct TOC_ENTRY *)malloc(archive_cookie.toc_length);
+    if (archive->toc == NULL) {
+        PYI_PERROR("malloc", "Could not allocate buffer for TOC!\n");
+        goto fail;
+    }
+    memcpy(archive->toc, archive->pkg_data + archive_cookie.toc_offset, archive_cookie.toc_length);
+    archive->toc_end = (const struct TOC_ENTRY *)(((const char *)archive->toc) + archive_cookie.toc_length);
+
+    toc_entry = archive->toc;
+    while (toc_entry < archive->toc_end) {
+        toc_entry->entry_length = pyi_be32toh(toc_entry->entry_length);
+        toc_entry->offset = pyi_be32toh(toc_entry->offset);
+        toc_entry->length = pyi_be32toh(toc_entry->length);
+        toc_entry->uncompressed_length = pyi_be32toh(toc_entry->uncompressed_length);
+        archive->contains_extractable_entries |= _pyi_archive_is_extractable(toc_entry->typecode);
+        if (toc_entry->typecode == ARCHIVE_ITEM_SPLASH) {
+            archive->toc_splash = toc_entry;
+        }
+        toc_entry = (struct TOC_ENTRY *)((const char *)toc_entry + toc_entry->entry_length);
+    }
+
+    PYI_DEBUG("LOADER: WWN encrypted archive loaded from memory\n");
+    *archive_ref = archive;
+    return 1;
+
+fail:
+    if (archive) {
+        free(archive->toc);
+        free(archive->pkg_data);
+        free(archive);
+    }
+    return -1;
+}
+
+
 /*
  * Return pointer to the next TOC entry in the TOC buffer.
  */
@@ -139,6 +301,81 @@ cleanup:
     return rc;
 }
 
+static int
+_pyi_archive_extract_compressed_memory(const unsigned char *src, const struct TOC_ENTRY *toc_entry, FILE *out_fp, unsigned char *out_ptr)
+{
+    const size_t CHUNK_SIZE = 8192;
+    unsigned char *buffer_out = NULL;
+    uint64_t remaining_size;
+    z_stream zstream;
+    int rc = -1;
+
+    zstream.zalloc = Z_NULL;
+    zstream.zfree = Z_NULL;
+    zstream.opaque = Z_NULL;
+    zstream.avail_in = 0;
+    zstream.next_in = Z_NULL;
+    rc = inflateInit(&zstream);
+    if (rc != Z_OK) {
+        PYI_ERROR("Failed to extract %s: inflateInit() failed with return code %d!\n", toc_entry->name, rc);
+        return -1;
+    }
+
+    buffer_out = (unsigned char *)malloc(CHUNK_SIZE);
+    if (buffer_out == NULL) {
+        PYI_PERROR("malloc", "Failed to extract %s: failed to allocate temporary output buffer!\n", toc_entry->name);
+        goto cleanup;
+    }
+
+    remaining_size = toc_entry->length;
+    do {
+        size_t chunk_size = (CHUNK_SIZE < remaining_size) ? CHUNK_SIZE : (size_t)remaining_size;
+        zstream.avail_in = (uInt)chunk_size;
+        zstream.next_in = (unsigned char *)src;
+        src += chunk_size;
+        remaining_size -= chunk_size;
+
+        do {
+            size_t out_len;
+            zstream.avail_out = (uInt)CHUNK_SIZE;
+            zstream.next_out = buffer_out;
+            rc = inflate(&zstream, Z_NO_FLUSH);
+            switch (rc) {
+                case Z_NEED_DICT:
+                    rc = Z_DATA_ERROR;
+                case Z_DATA_ERROR:
+                case Z_MEM_ERROR:
+                case Z_STREAM_ERROR:
+                    goto decompress_end;
+            }
+            out_len = CHUNK_SIZE - zstream.avail_out;
+            if (out_fp) {
+                if (fwrite(buffer_out, 1, out_len, out_fp) != out_len || ferror(out_fp)) {
+                    rc = Z_ERRNO;
+                    goto decompress_end;
+                }
+            } else if (out_ptr) {
+                memcpy(out_ptr, buffer_out, out_len);
+                out_ptr += out_len;
+            }
+        } while (zstream.avail_out == 0);
+    } while (rc != Z_STREAM_END && remaining_size > 0);
+
+decompress_end:
+    if (rc == Z_STREAM_END) {
+        rc = 0;
+    } else {
+        PYI_ERROR("Failed to extract %s: decompression resulted in return code %d!\n", toc_entry->name, rc);
+        rc = -1;
+    }
+
+cleanup:
+    inflateEnd(&zstream);
+    free(buffer_out);
+
+    return rc;
+}
+
 /*
  * Helper for pyi_archive_extract2fs that extracts an uncompressed file
  * from the archive into the provided file handle.
@@ -215,22 +452,38 @@ pyi_archive_extract(const struct ARCHIVE *archive, const struct TOC_ENTRY *toc_e
     unsigned char *data = NULL;
     int rc = 0;
 
+    /* Allocate the data buffer */
+    data = (unsigned char *)malloc(toc_entry->uncompressed_length);
+    if (data == NULL) {
+        PYI_PERROR("malloc", "Failed to extract %s: failed to allocate data buffer (%u bytes)!\n", toc_entry->name, toc_entry->uncompressed_length);
+        return NULL;
+    }
+
+    if (archive->pkg_data) {
+        const unsigned char *entry_data = archive->pkg_data + toc_entry->offset;
+        if (toc_entry->compression_flag == 1) {
+            rc = _pyi_archive_extract_compressed_memory(entry_data, toc_entry, NULL, data);
+        } else {
+            memcpy(data, entry_data, toc_entry->uncompressed_length);
+            rc = 0;
+        }
+        if (rc != 0) {
+            free(data);
+            data = NULL;
+        }
+        return data;
+    }
+
     /* Open archive (source) file... */
     archive_fp = pyi_path_fopen(archive->filename, "rb");
     if (archive_fp == NULL) {
         PYI_ERROR("Failed to extract %s: failed to open archive file!\n", toc_entry->name);
+        free(data);
         return NULL;
     }
     /* ... and seek to the beginning of entry's data */
     if (pyi_fseek(archive_fp, archive->pkg_offset + toc_entry->offset, SEEK_SET) < 0) {
         PYI_PERROR("fseek", "Failed to extract %s: failed to seek to the entry's data!\n", toc_entry->name);
-        goto cleanup;
-    }
-
-    /* Allocate the data buffer */
-    data = (unsigned char *)malloc(toc_entry->uncompressed_length);
-    if (data == NULL) {
-        PYI_PERROR("malloc", "Failed to extract %s: failed to allocate data buffer (%u bytes)!\n", toc_entry->name, toc_entry->uncompressed_length);
         goto cleanup;
     }
 
@@ -299,6 +552,19 @@ pyi_archive_extract2fs(const struct ARCHIVE *archive, const struct TOC_ENTRY *to
     if (out_fp == NULL) {
         PYI_PERROR("fopen", "Failed to extract %s: failed to open target file!\n", toc_entry->name);
         return -1;
+    }
+
+    if (archive->pkg_data) {
+        const unsigned char *entry_data = archive->pkg_data + toc_entry->offset;
+        if (toc_entry->compression_flag == 1) {
+            rc = _pyi_archive_extract_compressed_memory(entry_data, toc_entry, out_fp, NULL);
+        } else {
+            if (fwrite(entry_data, 1, toc_entry->uncompressed_length, out_fp) != toc_entry->uncompressed_length || ferror(out_fp)) {
+                PYI_PERROR("fwrite", "Failed to extract %s: failed to write data chunk!\n", toc_entry->name);
+                rc = -1;
+            }
+        }
+        goto cleanup;
     }
 
     /* Open archive (source) file... */
@@ -403,6 +669,10 @@ pyi_archive_open(const char *filename)
     if (archive_fp == NULL) {
         PYI_DEBUG("LOADER: cannot open archive: %s\n", filename);
         return NULL;
+    }
+
+    if (_wwn_archive_try_open(archive_fp, filename, &archive) != 0) {
+        goto cleanup;
     }
 
     /* Search for the embedded archive's cookie */
@@ -517,6 +787,7 @@ pyi_archive_free(struct ARCHIVE **archive_ref)
 
     /* Free the TOC buffer */
     free(archive->toc);
+    free(archive->pkg_data);
 
     /* Free the structure itself */
     free(archive);
